@@ -362,6 +362,7 @@ InferenceResult run_inference_ort(const InferenceParams& params) {
     #include "llama.h"
 
     #include "decode_loop.h"
+    #include "llama_gpu.h"
     #include "sampler_chain.h" // shared sampler chain (#125); needs llama.h
     #include "xllama/llama_raii.h"
 
@@ -388,7 +389,8 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     }
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0; // CPU only on Linux path
+    const int gpu_layers = apply_gguf_gpu_layers(params.n_gpu_layers, mparams);
+    res.gpu_layers = gpu_layers;
 
     if (params.on_status)
         params.on_status("loading model");
@@ -403,6 +405,15 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     }
     LlamaModelPtr model(raw_model);
     log_output("[xllama] model loaded\n");
+    if (gpu_layers > 0) {
+        const GpuMemInfo gpu = gpu_mem_info();
+        if (gpu.available) {
+            res.gpu_mem_mb = gpu.current_mb;
+            res.gpu_budget_mb = gpu.budget_mb;
+            log_output("[xllama] gpu-mem post-load: current=" + std::to_string(gpu.current_mb) +
+                       "MB budget=" + std::to_string(gpu.budget_mb) + "MB\n");
+        }
+    }
 
     LlamaAdapterLoraPtr adapter;
     if (!params.lora_path.empty()) {
@@ -433,6 +444,7 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
         cparams.n_batch = static_cast<uint32_t>(params.n_batch);
     if (params.n_ubatch > 0)
         cparams.n_ubatch = static_cast<uint32_t>(params.n_ubatch);
+    apply_gguf_gpu_context(gpu_layers, cparams);
     if (params.n_batch > 0 || params.n_ubatch > 0)
         log_output("[xllama] prefill batch override: n_batch=" + std::to_string(cparams.n_batch) +
                    " n_ubatch=" + std::to_string(cparams.n_ubatch) + "\n");
@@ -445,6 +457,7 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
         log_output("[xllama] KV cache: q8_0 + flash attention (#171)\n");
     }
 
+    GgufCpuThreadpools cpu_pools; // outlives ctx below (llama_gpu.h)
     llama_context* raw_ctx = llama_init_from_model(model.get(), cparams);
     if (!raw_ctx && params.kv_q8) {
         log_output("[xllama] q8_0 KV context failed — falling back to default cache types\n");
@@ -459,6 +472,8 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
         return res;
     }
     LlamaContextPtr ctx(raw_ctx);
+    cpu_pools.attach(gpu_layers, ctx.get(), static_cast<int>(cparams.n_threads),
+                     static_cast<int>(cparams.n_threads_batch));
 
     if (adapter) {
         llama_adapter_lora* arr[1] = {adapter.get()};
@@ -570,6 +585,7 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
     dlp.echo_stdout = params.echo_stdout;
     dlp.decode_start = t_gen0;
     dlp.prompt_lookup = params.prompt_lookup;
+    dlp.ignore_eog = params.ignore_eog;
     dlp.token_history = params.prompt_lookup ? &gen_history : nullptr;
     const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
     const int n_generated = dlr.n_generated;

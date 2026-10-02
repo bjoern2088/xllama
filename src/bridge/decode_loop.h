@@ -96,6 +96,12 @@ struct DecodeLoopParams {
     std::vector<llama_token>* token_history = nullptr;
     int spec_n_gram = kSpecNgramDefault;
     int spec_k = kSpecDraftKDefault;
+
+    // Bench only: keep decoding through end-of-generation so every run decodes
+    // exactly n_predict tokens. Two backends whose arithmetic differs (CPU q8
+    // activations vs d3d12 f32) reach EOG at different points, and a decode
+    // tok/s over a handful of tokens is noise (D2b). Default off.
+    bool ignore_eog = false;
 };
 
 struct DecodeLoopResult {
@@ -137,6 +143,12 @@ inline void accept_token(const DecodeLoopParams& p, llama_token token) {
         p.on_accepted(token);
     else if (p.token_history)
         p.token_history->push_back(token);
+}
+
+// The one end-of-generation decision for every branch of decode_loop (classic,
+// pre-draft, draft commit, spec reject), so ignore_eog cannot drift between them.
+inline bool stops_at_eog(const DecodeLoopParams& p, llama_token token) {
+    return llama_vocab_is_eog(p.vocab, token) && !p.ignore_eog;
 }
 
 // Decode one already-sampled token (classic path).
@@ -243,7 +255,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
             break;
 
         llama_token token = llama_sampler_sample(p.sampler, p.ctx, -1);
-        if (llama_vocab_is_eog(p.vocab, token)) {
+        if (detail::stops_at_eog(p, token)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) + " tokens\n");
             break;
         }
@@ -286,7 +298,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         // (same sample classic would take next). If it disagrees, that sample
         // *is* the true next token — classic_step it and skip the batch.
         const llama_token first = llama_sampler_sample(p.sampler, p.ctx, -1);
-        if (llama_vocab_is_eog(p.vocab, first)) {
+        if (detail::stops_at_eog(p, first)) {
             log_output("[xllama] EOG after " + std::to_string(out.n_generated) +
                        " tokens (pre-draft)\n");
             break;
@@ -334,7 +346,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
         int n_keep = 0;
         auto commit_draft = [&](llama_token tok) -> bool {
             // returns false → stop outer loop
-            if (llama_vocab_is_eog(p.vocab, tok)) {
+            if (detail::stops_at_eog(p, tok)) {
                 log_output("[xllama] EOG after " + std::to_string(out.n_generated) +
                            " tokens (spec)\n");
                 return false;
@@ -386,7 +398,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
                 stop_all = true;
                 break;
             }
-            if (llama_vocab_is_eog(p.vocab, cand)) {
+            if (detail::stops_at_eog(p, cand)) {
                 log_output("[xllama] EOG after " + std::to_string(out.n_generated) +
                            " tokens (spec reject)\n");
                 stop_all = true;

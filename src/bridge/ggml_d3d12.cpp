@@ -286,20 +286,29 @@ struct Gpu {
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
-    ComPtr<ID3D12Resource> staging;  // 64 MiB upload ring for weight uploads
-    ComPtr<ID3D12Resource> readback; // 64 MiB for get_tensor on weights
+    ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
+    ComPtr<ID3D12Resource> readback; // get_tensor on weights (kStagingBytes)
     std::uint8_t* staging_ptr = nullptr;
     std::uint8_t* readback_ptr = nullptr;
     d3d12c::QueueFence fence;
     UINT64 ts_freq = 0;
     LUID luid = {};
     double last_gpu_ms = 0.0;
+    // Per-backend-lifetime counters, logged when the backend is freed.
+    std::uint64_t n_calls = 0;
+    std::uint64_t n_matmuls = 0;
+    double wall_ms = 0.0;
+    double gpu_ms = 0.0;
     std::mutex mu;
     bool ok = false;
     std::string error;
 };
 
-constexpr UINT64 kStagingBytes = 64ull << 20;
+// Weight upload / readback ring. Mapped for the process lifetime and counted in
+// its working set, so it stays small: 64 MiB each put the first GPU-layer
+// smoke at 640 MB peak vs 311 MB on the CPU (D2b); 8 MiB costs a few more
+// round trips at load only.
+constexpr UINT64 kStagingBytes = 8ull << 20;
 
 ComPtr<ID3D12RootSignature> make_root_sig(ID3D12Device* device, std::string* err) {
     D3D12_ROOT_PARAMETER p[4] = {};
@@ -619,6 +628,12 @@ ggml_backend_buffer_t alloc_buf(ggml_backend_buffer_type_t buft, size_t size, bo
         return nullptr;
     }
     c->va = c->res->GetGPUVirtualAddress();
+    if (size >= (1u << 20)) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "[xllama] d3d12: %s buffer %.1f MiB\n",
+                      host ? "D3D12_Host" : "D3D12_Weights", static_cast<double>(size) / 1048576.0);
+        log_output(msg);
+    }
     return ggml_backend_buffer_init(buft, host ? kHostBufIface : kWeightsBufIface, c, size);
 }
 
@@ -652,6 +667,19 @@ const char* backend_name(ggml_backend_t) {
     return "D3D12";
 }
 void backend_free(ggml_backend_t b) {
+    Gpu& g = gpu();
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "[xllama] d3d12: %llu graph_compute calls, %llu matmuls, %.1f ms wall "
+                      "(%.1f ms GPU)\n",
+                      static_cast<unsigned long long>(g.n_calls),
+                      static_cast<unsigned long long>(g.n_matmuls), g.wall_ms, g.gpu_ms);
+        log_output(msg);
+        g.n_calls = g.n_matmuls = 0;
+        g.wall_ms = g.gpu_ms = 0.0;
+    }
     delete b;
 }
 
@@ -680,6 +708,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         return GGML_STATUS_SUCCESS;
 
     std::lock_guard<std::mutex> lock(g.mu);
+    const auto t0 = std::chrono::steady_clock::now();
     const bool ts = g.ts && g.ts_rb;
     const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
         cl->SetComputeRootSignature(g.root.Get());
@@ -729,6 +758,11 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             g.ts_rb->Unmap(0, nullptr);
         }
     }
+    ++g.n_calls;
+    g.n_matmuls += mm.size();
+    g.gpu_ms += g.last_gpu_ms;
+    g.wall_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return GGML_STATUS_SUCCESS;
 }
 
@@ -827,7 +861,24 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
         d.src0_contiguous = ggml_is_contiguous(w);
         d.src1_contiguous = ggml_is_contiguous(x);
         d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
-        return d3d12_mm_supported(d);
+        const bool ok = d3d12_mm_supported(d);
+        // A refused matmul whose weight already sits in D3D12_Weights means a
+        // placement the backend then cannot run — log the first few (D2b #309).
+        static int logged = 0;
+        if (!ok && w->buffer && w->buffer->buft == &kWeightsBuft && logged < 8) {
+            ++logged;
+            char msg[256];
+            std::snprintf(msg, sizeof(msg),
+                          "[xllama] d3d12: MUL_MAT refused: %s %lldx%lld x [%lld,%lld,%lld,%lld] "
+                          "src1=%s dst=%s\n",
+                          ggml_type_name(w->type), static_cast<long long>(w->ne[0]),
+                          static_cast<long long>(w->ne[1]), static_cast<long long>(x->ne[0]),
+                          static_cast<long long>(x->ne[1]), static_cast<long long>(x->ne[2]),
+                          static_cast<long long>(x->ne[3]), ggml_type_name(x->type),
+                          ggml_type_name(op->type));
+            log_output(msg);
+        }
+        return ok;
     }
     default:
         return false;
@@ -845,7 +896,10 @@ const ggml_backend_device_i kDeviceIface = {
     /* .get_props            = */ dev_props,
     /* .init_backend         = */ dev_init_backend,
     /* .get_buffer_type      = */ dev_buffer_type,
-    /* .get_host_buffer_type = */ nullptr,
+    // The default buft doubles as the host buft: llama.cpp then allocates the
+    // CPU backend's compute buffer in D3D12_Host, which supports_buft accepts,
+    // so the scheduler stops copying every matmul input into a second buffer.
+    /* .get_host_buffer_type = */ dev_buffer_type,
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ dev_supports_op,
     /* .supports_buft        = */ dev_supports_buft,
