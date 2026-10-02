@@ -7,6 +7,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+- **GGUF GPU decode D2-r2 = PASS** (#228). Series S, CI 1.6.0.1156, opt-in
+  backend `d3d12`, every layer on the GPU:
+  - Coder-3B: decode 1.60×, prefill 1.27×, peak +159 / +125 MB;
+  - LFM2.5-1.2B: decode 1.64×, prefill 1.82×, peak +163 / +156 MB;
+  - H9 6/8 = 6/8 on both, and `validate-console.sh all` passes with the knob
+    and without it.
+  - A fix found on the way: zero-size ops (ubatches without output rows) are
+    now no-ops on the backend. Before, the scheduler copied weights to the
+    CPU, which timed out `validate genroom` and pushed Coder-3B to +220 MB.
+  - The default stays CPU until the D3 per-model decision.
+
+- **d3d12 GGUF layers: lower peak RAM** (#309).
+  - A tied Q6_K `token_embd` now lives once, in `D3D12_Weights`: `GET_ROWS`
+    runs on the GPU and placement goes through `tensor_buft_overrides`.
+  - The GPU compute reserve is sized for one logits row (`n_outputs_max`).
+  - Every GGUF load logs its working set per stage (`[xllama] ws …`).
+  - Series S (CI 1.6.0.1148): peak with all layers on the GPU drops on
+    Coder-3B from 2583 to 2203 MB (CPU 2044), and on LFM2.5-1.2B from 1048 to
+    946 MB (CPU 783).
+  - For D2-r2 and D3 the RAM criterion is now a product one, decided before
+    the run: peak ≤ 3584 MB and ≤ 200 MB over the CPU run.
+  - The output cap follows what the context requests: 1 row for
+    prefill/decode, 1 + draft with prompt lookup, llama.cpp's default for
+    embeddings. A blanket cap of 1 aborted those batches; an independent
+    review caught it before merge.
+  - The selftest times a median of 5 runs and covers GET_ROWS.
+
 - **d3d12 GGUF layers: q8 activations** (#312). The backend now quantizes each
   matmul input on the CPU with ggml's own `from_float` (q8_0 / q8_K), exactly
   as the CPU backend does, and the kernels sum integers (`dot4add_i8packed`,

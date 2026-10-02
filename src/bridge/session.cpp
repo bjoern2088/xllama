@@ -486,7 +486,8 @@ class LlamaSession final : public Session {
                 cparams.n_batch = static_cast<uint32_t>(m_n_batch);
             if (m_n_ubatch > 0)
                 cparams.n_ubatch = static_cast<uint32_t>(m_n_ubatch);
-            apply_gguf_gpu_context(m_gpu_layers, cparams);
+            apply_gguf_gpu_context(m_gpu_layers, cparams,
+                                   gguf_gpu_outputs_max(for_embedding, m_prompt_lookup));
             if (for_embedding) {
                 // Non-causal embedding graphs cannot split a sequence into
                 // physical micro-batches (llama.cpp asserts instead of failing).
@@ -513,6 +514,7 @@ class LlamaSession final : public Session {
                 m_ctx.reset(llama_init_from_model(m_model.get(), cparams));
             }
             m_cpu_pools.attach(m_gpu_layers, m_ctx.get(), m_n_threads, m_n_threads);
+            log_gguf_ws("after context");
             if (!m_ctx) {
                 if (err)
                     *err = "failed to create context";
@@ -1218,9 +1220,10 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     }
 
     llama_model_params mparams = llama_model_default_params();
-    const int gpu_layers = apply_gguf_gpu_layers(sp.n_gpu_layers, mparams);
+    const int gpu_layers = apply_gguf_gpu_layers(sp.n_gpu_layers, mparams, abs_path);
 
     llama_model* raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);
+    log_gguf_ws("after model load");
     if (!raw_model) {
         if (err)
             *err = "failed to load model: " + abs_path;

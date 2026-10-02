@@ -27,8 +27,12 @@ bool d3d12_weight_type_supported(ggml_type t) {
 
 D3d12Dispatch d3d12_mm_dispatch(std::int64_t n, std::int64_t ncols) {
     D3d12Dispatch d;
-    if (n <= 0 || ncols <= 0)
+    if (n <= 0 || ncols < 0)
         return d;
+    if (ncols == 0) { // no output rows in this ubatch: a no-op, still ours
+        d.ok = true;
+        return d;
+    }
     const std::int64_t gx = (n + kD3d12MmvRows - 1) / kD3d12MmvRows;
     d.ok = gx <= kD3d12MaxGroups && ncols <= kD3d12MaxGroups;
     if (d.ok) {
@@ -48,6 +52,22 @@ bool d3d12_mm_supported(const D3d12MatmulDesc& d) {
            d.dst_type == GGML_TYPE_F32 && d.ne00 > 0 && d.ne00 % kD3d12Chunk == 0 &&
            d.ne00 == d.ne10 && d.ne02 == 1 && d.ne03 == 1 && d.ne12 == 1 && d.ne13 == 1 &&
            d3d12_mm_dispatch(d.ne01, d.ne11).ok;
+}
+
+bool d3d12_get_rows_type_supported(ggml_type t) {
+    return t == GGML_TYPE_Q6_K;
+}
+
+bool d3d12_get_rows_supported(const D3d12GetRowsDesc& d) {
+    return d3d12_get_rows_type_supported(d.src0_type) && d.src0_in_weight_buffer &&
+           d.src0_contiguous && d.src1_contiguous && d.src1_type == GGML_TYPE_I32 &&
+           d.dst_type == GGML_TYPE_F32 && d.ne00 > 0 && d.ne00 % kD3d12Chunk == 0 && d.ne02 == 1 &&
+           d.ne03 == 1 && d.ne10 >= 0 && d.ne10 <= kD3d12MaxGroups && d.ne11 == 1 && d.ne12 == 1 &&
+           d.ne00 / kD3d12Chunk <= kD3d12MaxGroups;
+}
+
+bool d3d12_place_tied_embedding(ggml_type embd_type, bool has_output_weight) {
+    return !has_output_weight && d3d12_get_rows_type_supported(embd_type);
 }
 
 // --- Host emulation of shaders/ggml_d3d12_mmv_*.hlsl ---
@@ -217,6 +237,41 @@ void d3d12_mmv_emulate(ggml_type t, const std::uint8_t* w, std::size_t w_row_byt
     }
 }
 
+void d3d12_get_rows_emulate(ggml_type t, const std::uint8_t* w, std::size_t w_row_bytes,
+                            const std::int32_t* ids, int n_ids, int k, float* y,
+                            std::size_t y_stride) {
+    if (!w || !ids || !y || n_ids <= 0 || k <= 0 || k % kD3d12Chunk != 0 ||
+        !d3d12_get_rows_type_supported(t))
+        return;
+    auto ld8 = [&](std::uint32_t a) { return (ld32(w, a & ~3u) >> ((a & 3u) * 8u)) & 0xffu; };
+    // One thread group per (256-element chunk, id); thread tid = 32v + l writes
+    // elements 128v + l + {0, 32, 64, 96}, as dequantize_row_q6_K's inner loop.
+    for (int i = 0; i < n_ids; ++i) {
+        for (std::uint32_t blk = 0; blk < static_cast<std::uint32_t>(k / kD3d12Chunk); ++blk) {
+            const std::uint32_t bb = static_cast<std::uint32_t>(ids[i] * w_row_bytes) + blk * 210u;
+            const float d = h2f(ld16(w, bb + 208u));
+            for (std::uint32_t tid = 0; tid < 64u; ++tid) {
+                const std::uint32_t v = tid >> 5, l = tid & 31u, is = l >> 4;
+                const std::uint32_t qla = ld8(bb + 64u * v + l), qlb = ld8(bb + 64u * v + l + 32u);
+                const std::uint32_t qh = ld8(bb + 128u + 32u * v + l);
+                auto sc = [&](std::uint32_t j) {
+                    return static_cast<float>(
+                        static_cast<std::int8_t>(ld8(bb + 192u + 8u * v + is + j)));
+                };
+                const int q1 = static_cast<int>((qla & 0xFu) | (((qh >> 0) & 3u) << 4)) - 32;
+                const int q2 = static_cast<int>((qlb & 0xFu) | (((qh >> 2) & 3u) << 4)) - 32;
+                const int q3 = static_cast<int>((qla >> 4) | (((qh >> 4) & 3u) << 4)) - 32;
+                const int q4 = static_cast<int>((qlb >> 4) | (((qh >> 6) & 3u) << 4)) - 32;
+                float* out = y + static_cast<std::size_t>(i) * y_stride + blk * 256u + 128u * v + l;
+                out[0] = d * sc(0) * static_cast<float>(q1);
+                out[32] = d * sc(2) * static_cast<float>(q2);
+                out[64] = d * sc(4) * static_cast<float>(q3);
+                out[96] = d * sc(6) * static_cast<float>(q4);
+            }
+        }
+    }
+}
+
 // --- Selftest CSV ---
 
 const char* d3d12_selftest_csv_header() {
@@ -248,6 +303,10 @@ bool ggml_d3d12_register() {
     return false;
 }
 
+ggml_backend_buffer_type_t ggml_d3d12_weights_buft() {
+    return nullptr;
+}
+
 void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     if (!out)
         return;
@@ -272,6 +331,7 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
         #include "ggml-alloc.h"
         #include "ggml-backend-impl.h"
         #include "ggml-backend.h"
+        #include "ggml_d3d12_get_rows_q6_k_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t128_dxil.h"
         #include "ggml_d3d12_mmv_q4_0_t64_dxil.h"
         #include "ggml_d3d12_mmv_q4_k_t128_dxil.h"
@@ -309,6 +369,7 @@ struct Gpu {
     ComPtr<ID3D12GraphicsCommandList> cl;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pso[kPsoCount][2]; // [type][0 = 64 threads, 1 = 128]
+    ComPtr<ID3D12PipelineState> pso_get_rows;      // Q6_K
     ComPtr<ID3D12QueryHeap> ts;
     ComPtr<ID3D12Resource> ts_rb;
     ComPtr<ID3D12Resource> staging;  // weight upload ring (kStagingBytes)
@@ -326,7 +387,7 @@ struct Gpu {
     double last_gpu_ms = 0.0;
     // Per-backend-lifetime counters, logged when the backend is freed.
     std::uint64_t n_calls = 0;
-    std::uint64_t n_matmuls = 0;
+    std::uint64_t n_dispatches = 0; // MUL_MAT + GET_ROWS
     double wall_ms = 0.0;
     double gpu_ms = 0.0;
     std::mutex mu;
@@ -429,6 +490,17 @@ bool init_gpu(Gpu& g) {
                 err = d3d12c::hr_message("CreateComputePipelineState", hr);
                 return false;
             }
+        }
+    }
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature = g.root.Get();
+        pd.CS.pShaderBytecode = kGgmlD3d12GetRowsQ6KDxil;
+        pd.CS.BytecodeLength = kGgmlD3d12GetRowsQ6KDxilSize;
+        hr = g.device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.pso_get_rows));
+        if (FAILED(hr)) {
+            err = d3d12c::hr_message("CreateComputePipelineState", hr);
+            return false;
         }
     }
     if (SUCCEEDED(g.queue->GetTimestampFrequency(&g.ts_freq)) && g.ts_freq > 0) {
@@ -702,12 +774,12 @@ void backend_free(ggml_backend_t b) {
         std::lock_guard<std::mutex> lock(g.mu);
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "[xllama] d3d12: %llu graph_compute calls, %llu matmuls, %.1f ms wall "
+                      "[xllama] d3d12: %llu graph_compute calls, %llu dispatches, %.1f ms wall "
                       "(%.1f ms GPU)\n",
                       static_cast<unsigned long long>(g.n_calls),
-                      static_cast<unsigned long long>(g.n_matmuls), g.wall_ms, g.gpu_ms);
+                      static_cast<unsigned long long>(g.n_dispatches), g.wall_ms, g.gpu_ms);
         log_output(msg);
-        g.n_calls = g.n_matmuls = 0;
+        g.n_calls = g.n_dispatches = 0;
         g.wall_ms = g.gpu_ms = 0.0;
     }
     delete b;
@@ -747,23 +819,43 @@ const ggml_tensor* base_of(const ggml_tensor* t) {
     return t;
 }
 
-struct MmOp {
+// One dispatch: a MUL_MAT (u1 = its quantized input) or a GET_ROWS (u1 = its
+// row ids), both staged in g.xq.
+struct Op {
     const ggml_tensor* node;
-    std::size_t xq_off;   // first quantized column in g.xq
-    std::uint32_t xq_row; // bytes per quantized column
+    std::size_t xq_off;   // staged input in g.xq
+    std::uint32_t xq_row; // bytes per quantized column (MUL_MAT)
 };
 
 // Record and run one submission. Caller holds g.mu.
-bool submit_ops(Gpu& g, const std::vector<MmOp>& ops) {
+bool submit_ops(Gpu& g, const std::vector<Op>& ops) {
     const bool ts = g.ts && g.ts_rb;
     const bool ran = run_now(g, [&](ID3D12GraphicsCommandList* cl) {
         cl->SetComputeRootSignature(g.root.Get());
         if (ts)
             cl->EndQuery(g.ts.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         const D3D12_GPU_VIRTUAL_ADDRESS xq_va = g.xq->GetGPUVirtualAddress();
-        for (const MmOp& op : ops) {
+        for (const Op& op : ops) {
             const ggml_tensor* node = op.node;
             const ggml_tensor* w = node->src[0];
+            if (node->op == GGML_OP_GET_ROWS) {
+                const std::uint32_t c[8] = {static_cast<std::uint32_t>(node->ne[1]),
+                                            static_cast<std::uint32_t>(w->ne[0]),
+                                            static_cast<std::uint32_t>(w->ne[0] / kD3d12Chunk),
+                                            static_cast<std::uint32_t>(w->nb[1]),
+                                            0,
+                                            static_cast<std::uint32_t>(node->nb[1] / sizeof(float)),
+                                            0,
+                                            0};
+                cl->SetPipelineState(g.pso_get_rows.Get());
+                cl->SetComputeRoot32BitConstants(0, 8, c, 0);
+                cl->SetComputeRootShaderResourceView(1, tensor_va(w));
+                cl->SetComputeRootUnorderedAccessView(2, tensor_va(node));
+                cl->SetComputeRootUnorderedAccessView(3, xq_va + op.xq_off);
+                cl->Dispatch(static_cast<UINT>(w->ne[0] / kD3d12Chunk),
+                             static_cast<UINT>(node->ne[1]), 1);
+                continue;
+            }
             const D3d12Dispatch d = d3d12_mm_dispatch(node->ne[0], node->ne[1]);
             const std::uint32_t c[8] = {static_cast<std::uint32_t>(w->ne[1]),
                                         static_cast<std::uint32_t>(w->ne[0]),
@@ -798,7 +890,7 @@ bool submit_ops(Gpu& g, const std::vector<MmOp>& ops) {
             g.ts_rb->Unmap(0, nullptr);
         }
     }
-    g.n_matmuls += ops.size();
+    g.n_dispatches += ops.size();
     return true;
 }
 
@@ -811,6 +903,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
             continue;
         switch (node->op) {
         case GGML_OP_MUL_MAT:
+        case GGML_OP_GET_ROWS:
             mm.push_back(node);
             break;
         case GGML_OP_NONE:
@@ -833,13 +926,14 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
     // matmul whose input another matmul of the same batch produces (a LoRA
     // chain) waits for that batch. Matmuls sharing an input (q/k/v, gate/up)
     // share one quantized copy.
-    std::vector<MmOp> ops;
+    std::vector<Op> ops;
     std::vector<const ggml_tensor*> produced; // outputs of `ops`
     struct Quantized {
         const void* data;
         ggml_type type;
         std::size_t off;
         std::uint32_t row;
+        int ncols;
     };
     std::vector<Quantized> done;
     std::size_t used = 0;
@@ -859,6 +953,25 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         GGML_ASSERT(w->buffer && w->buffer->buft == &kWeightsBuft);
         GGML_ASSERT(x->buffer && ggml_backend_buffer_is_host(x->buffer));
         GGML_ASSERT(node->buffer && is_ours(node->buffer->buft));
+        if (ggml_nelements(node) == 0)
+            continue; // a ubatch without output rows: nothing to compute
+        if (node->op == GGML_OP_GET_ROWS) {
+            // Row ids are tiny: stage them next to the quantized activations.
+            const std::size_t bytes = static_cast<std::size_t>(x->ne[0]) * sizeof(std::int32_t);
+            if (used + bytes > g.xq_bytes && !flush())
+                return GGML_STATUS_FAILED;
+            if (!ensure_xq(g, used + bytes))
+                return GGML_STATUS_FAILED;
+            std::memcpy(g.xq_ptr + used, x->data, bytes);
+            // The kernel does not bound-check rows; ggml-cpu asserts the same.
+            const auto* ids = reinterpret_cast<const std::int32_t*>(g.xq_ptr + used);
+            for (std::int64_t i = 0; i < x->ne[0]; ++i)
+                GGML_ASSERT(ids[i] >= 0 && ids[i] < w->ne[1]);
+            ops.push_back({node, used, 0});
+            produced.push_back(base_of(node));
+            used += (bytes + 255) & ~std::size_t(255);
+            continue;
+        }
         const ggml_tensor* xb = base_of(x);
         for (const ggml_tensor* p : produced)
             if (p == xb) {
@@ -872,7 +985,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
         const std::uint32_t row = static_cast<std::uint32_t>(ggml_row_size(at, k));
         const Quantized* q = nullptr;
         for (const Quantized& d : done)
-            if (d.data == x->data && d.type == at && d.row == row)
+            if (d.data == x->data && d.type == at && d.row == row && d.ncols >= ncols)
                 q = &d;
         if (!q) {
             const std::size_t bytes = static_cast<std::size_t>(row) * ncols;
@@ -882,7 +995,7 @@ ggml_status backend_graph_compute(ggml_backend_t, ggml_cgraph* cgraph) {
                 return GGML_STATUS_FAILED;
             d3d12_quantize_activations(w->type, static_cast<const float*>(x->data),
                                        x->nb[1] / sizeof(float), k, ncols, g.xq_ptr + used);
-            done.push_back({x->data, at, used, row});
+            done.push_back({x->data, at, used, row, ncols});
             q = &done.back();
             used += (bytes + 255) & ~std::size_t(255); // root UAV addresses stay aligned
         }
@@ -929,7 +1042,7 @@ const char* dev_name(ggml_backend_dev_t) {
     return "D3D12";
 }
 const char* dev_description(ggml_backend_dev_t) {
-    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K matmul)";
+    return "xllama D3D12 compute (Q4_0/Q4_K/Q6_K matmul, Q6_K get_rows)";
 }
 void dev_memory(ggml_backend_dev_t, size_t* free, size_t* total) {
     *free = *total = 0;
@@ -1011,6 +1124,25 @@ bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor* op) {
             log_output(msg);
         }
         return ok;
+    }
+    case GGML_OP_GET_ROWS: {
+        const ggml_tensor* w = op->src[0];
+        const ggml_tensor* ids = op->src[1];
+        D3d12GetRowsDesc d;
+        d.src0_type = w->type;
+        d.ne00 = w->ne[0];
+        d.ne01 = w->ne[1];
+        d.ne02 = w->ne[2];
+        d.ne03 = w->ne[3];
+        d.src1_type = ids->type;
+        d.ne10 = ids->ne[0];
+        d.ne11 = ids->ne[1];
+        d.ne12 = ids->ne[2];
+        d.dst_type = op->type;
+        d.src0_contiguous = ggml_is_contiguous(w);
+        d.src1_contiguous = ggml_is_contiguous(ids);
+        d.src0_in_weight_buffer = w->buffer && w->buffer->buft == &kWeightsBuft;
+        return d3d12_get_rows_supported(d);
     }
     default:
         return false;
@@ -1108,9 +1240,15 @@ bool ggml_d3d12_register() {
     return registered;
 }
 
+ggml_backend_buffer_type_t ggml_d3d12_weights_buft() {
+    return ggml_d3d12_register() ? &kWeightsBuft : nullptr;
+}
+
 // --- Selftest ---
 
 namespace {
+
+constexpr int kSelftestTimedRuns = 5;
 
 struct SelftestCase {
     ggml_type type;
@@ -1200,17 +1338,23 @@ D3d12SelftestRow run_case(ggml_backend_t backend, const SelftestCase& sc) {
         cleanup();
         return row;
     }
-    // Warm-up, then the timed run.
+    // Warm-up, then the median of kSelftestTimedRuns: one sample of a ~9 MB
+    // matmul swung from 78 to 109 GB/s across back-to-back selftests (CI
+    // 1.6.0.1154, same blob).
     ggml_status st = ggml_backend_graph_compute(backend, gf);
-    if (st == GGML_STATUS_SUCCESS)
+    std::vector<double> ms;
+    for (int i = 0; i < kSelftestTimedRuns && st == GGML_STATUS_SUCCESS; ++i) {
         st = ggml_backend_graph_compute(backend, gf);
+        ms.push_back(gpu().last_gpu_ms);
+    }
     row.d3d12_ran = st == GGML_STATUS_SUCCESS;
     if (!row.d3d12_ran) {
         row.error = "graph_compute failed";
         cleanup();
         return row;
     }
-    row.gpu_ms = gpu().last_gpu_ms;
+    std::nth_element(ms.begin(), ms.begin() + ms.size() / 2, ms.end());
+    row.gpu_ms = ms[ms.size() / 2];
     row.packed_gbs = row.gpu_ms > 0.0 ? static_cast<double>(q.size()) / 1e6 / row.gpu_ms : 0.0;
     std::vector<float> yf(static_cast<std::size_t>(sc.n) * sc.ncols);
     ggml_backend_tensor_get(y, yf.data(), 0, yf.size() * sizeof(float));
@@ -1218,6 +1362,90 @@ D3d12SelftestRow run_case(ggml_backend_t backend, const SelftestCase& sc) {
     row.ok = row.rel_err <= kD3d12SelftestRelTol;
     if (!row.ok)
         row.error = "mismatch vs the CPU backend (q8 vec_dot)";
+    cleanup();
+    return row;
+}
+
+// GET_ROWS from a Q6_K weight (the tied token_embd path, #309): the GPU must
+// equal ggml's dequantizer bit for bit, as the host emulation does.
+D3d12SelftestRow run_get_rows_case(ggml_backend_t backend, int n, int k) {
+    D3d12SelftestRow row;
+    row.type = "get_rows_q6_k";
+    row.n = n;
+    row.k = k;
+    const std::int32_t ids_v[] = {0, 1, n / 2 + 1, n - 1, 7, n / 3};
+    const int n_ids = static_cast<int>(sizeof(ids_v) / sizeof(ids_v[0]));
+    row.ncols = n_ids;
+
+    ggml_init_params ip = {};
+    ip.mem_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead();
+    ip.no_alloc = true;
+    ggml_context* ctx_w = ggml_init(ip);
+    ggml_context* ctx_i = ggml_init(ip);
+    ggml_context* ctx_g = ggml_init(ip);
+    ggml_tensor* w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q6_K, k, n);
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx_i, GGML_TYPE_I32, n_ids);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &kWeightsBuft);
+    ggml_backend_buffer_t ibuf = ggml_backend_alloc_ctx_tensors_from_buft(ctx_i, &kHostBuft);
+    ggml_gallocr_t galloc = nullptr;
+    auto cleanup = [&] {
+        if (galloc)
+            ggml_gallocr_free(galloc);
+        if (wbuf)
+            ggml_backend_buffer_free(wbuf);
+        if (ibuf)
+            ggml_backend_buffer_free(ibuf);
+        ggml_free(ctx_g);
+        ggml_free(ctx_i);
+        ggml_free(ctx_w);
+    };
+    if (!wbuf || !ibuf) {
+        row.error = "buffer allocation failed";
+        cleanup();
+        return row;
+    }
+    std::mt19937 rng(99u);
+    std::uniform_real_distribution<float> uni(-1.f, 1.f);
+    std::vector<float> wf(static_cast<std::size_t>(n) * k);
+    for (float& v : wf)
+        v = uni(rng);
+    std::vector<std::uint8_t> q(ggml_nbytes(w));
+    ggml_quantize_chunk(GGML_TYPE_Q6_K, wf.data(), q.data(), 0, n, k, nullptr);
+    ggml_backend_tensor_set(w, q.data(), 0, q.size());
+    ggml_backend_tensor_set(ids, ids_v, 0, sizeof(ids_v));
+
+    ggml_tensor* y = ggml_get_rows(ctx_g, w, ids);
+    ggml_cgraph* gf = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+    galloc = ggml_gallocr_new(&kHostBuft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        row.error = "graph allocation failed";
+        cleanup();
+        return row;
+    }
+    row.d3d12_ran = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (!row.d3d12_ran) {
+        row.error = "graph_compute failed";
+        cleanup();
+        return row;
+    }
+    row.gpu_ms = gpu().last_gpu_ms;
+    std::vector<float> got(static_cast<std::size_t>(k) * n_ids), ref(static_cast<std::size_t>(k));
+    ggml_backend_tensor_get(y, got.data(), 0, got.size() * sizeof(float));
+    double max_ref = 0.0, max_diff = 0.0;
+    for (int i = 0; i < n_ids; ++i) {
+        ggml_get_type_traits(GGML_TYPE_Q6_K)
+            ->to_float(q.data() + static_cast<std::size_t>(ids_v[i]) * w->nb[1], ref.data(), k);
+        for (int j = 0; j < k; ++j) {
+            max_ref = std::max(max_ref, std::fabs(static_cast<double>(ref[j])));
+            max_diff = std::max(max_diff, std::fabs(static_cast<double>(ref[j]) -
+                                                    got[static_cast<std::size_t>(i) * k + j]));
+        }
+    }
+    row.rel_err = max_ref > 0.0 ? max_diff / max_ref : max_diff;
+    row.ok = max_diff == 0.0; // bit-exact, like the host emulation
+    if (!row.ok)
+        row.error = "mismatch vs ggml dequantize_row_q6_K";
     cleanup();
     return row;
 }
@@ -1246,6 +1474,8 @@ void run_d3d12_selftest(std::vector<D3d12SelftestRow>* out) {
     };
     for (const auto& sc : cases)
         out->push_back(run_case(backend, sc));
+    out->push_back(run_get_rows_case(backend, 151936, 2048)); // Coder-3B tied token_embd
+    out->push_back(run_get_rows_case(backend, 65536, 1024));  // LFM2.5-350M
     ggml_backend_free(backend);
 }
 
