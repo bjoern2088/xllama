@@ -299,6 +299,45 @@ criterion passes.
 Follow-ups: peak RAM #309, CPU-side split cost #310, numerics #312,
 multi-column prefill #313.
 
+### D2-r2 — fixing the two failures (predeclared 2026-10-02, before any run)
+
+The gate below is the D2 gate unchanged, re-measured after two fixes.
+
+**Fix A, numerics (#312).** Activations are quantized on the CPU with ggml's
+own `from_float` into the weight's `vec_dot_type`, exactly as the CPU
+backend feeds its `vec_dot`: q8_0 for Q4_0, q8_K for Q4_K and Q6_K. The
+kernels sum integers with `dot4add_i8packed` (cs_6_4), so GPU and CPU differ
+only in float summation order. Gate A:
+
+- console selftest (`scripts/bench-d3d12-selftest.sh`): 12/12 cases within
+  rel 1e-5 of the CPU backend's q8 `vec_dot` (host emulation: ≤ 3.6e-7), and
+  every decode shape ≥ 100 GB/s packed;
+- H9 via the LAN API ≥ the CPU run on Coder-3B and LFM2.5-1.2B.
+
+**Gate A result (2026-10-02, CI `1.6.0.1144`): PASS.**
+
+- **Selftest** (`bench/results/2026-10-02-d2r2-gatea-selftest.csv`): 12/12
+  cases within ≤ 2.9e-7 of the CPU backend. Decode shapes run at 109–164 GB/s
+  packed; q4_k 11008 × 2048 went from 143.6 to 164.0, q6_k 65536 × 1024 from
+  114.4 to 137.7.
+- **H9** (`2026-10-02-d2r2-gatea-h9-{cpu,gpu}.jsonl`, LAN API, XAML process):
+  Coder-3B 6/8 = 6/8 and LFM2.5-1.2B 6/8 = 6/8, failing the same tasks as the
+  CPU. Text is not byte-identical (float summation order), quality is.
+- **UI process end to end:** 1.52× (Coder-3B) and 1.49× (LFM2.5-1.2B).
+
+**Fix B, peak RAM (#309).**
+
+- One copy of a tied `token_embd`: `GET_ROWS` on the GPU, and the weight
+  placed in `D3D12_Weights`.
+- Working-set attribution of the remaining excess.
+
+**D2-r2:**
+
+- the D2 criteria above, unchanged, peak RAM ≤ CPU included;
+- same scripts on the merged head's package.
+
+A model that fails a criterion keeps the CPU default.
+
 ### D3 — product decision
 
 Default on/off per model in `docs/model-matrix.md` after D2; the
