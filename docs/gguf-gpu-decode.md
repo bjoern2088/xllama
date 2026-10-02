@@ -1,9 +1,9 @@
 # GGUF GPU decode — design, gates and verdicts
 
 > **SSOT for the GGUF GPU decode design** (H6 follow-up, #228): architecture,
-> cost model, predeclared gates D1/D2 and their verdicts. Kernel evidence lives
-> in [phase15-re-opt.md](phase15-re-opt.md) (WS-E / H6.3). The gate tables
-> here are the verdict evidence of an opt-in path, read from the CSVs in
+> cost model, predeclared gates (D1, D2, D2-r2, D3, FA) and their verdicts.
+> Kernel evidence lives in [phase15-re-opt.md](phase15-re-opt.md) (WS-E /
+> H6.3). The gate tables here are verdict evidence, read from the CSVs in
 > `bench/results/` (listed in `bench/README.md`); shipped defaults stay in
 > [benchmarks.md](benchmarks.md). Platform limits are only in
 > [uwp-constraints.md](uwp-constraints.md).
@@ -529,6 +529,9 @@ reserve. With FA, prefill gains 22–29% and peak RAM over the CPU halves.
   ≈ 14.5 ms of wall over GPU time (sync, plus the CPU q8 quantize per
   submission). That is the D2-fused direction, a new decision with its own
   gate, not a #310 follow-up.
+- Next to other hardware (effective bandwidth as a share of peak, llama.cpp
+  Vulkan scoreboard): see
+  [benchmarks.md](benchmarks.md#gpu-decode-in-context--known-hardware).
 
 ## Decision log
 
