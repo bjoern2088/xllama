@@ -42,36 +42,35 @@ groupshared float red[NUM_ROWS][NUM_THREADS];
 
 // Q4_0 (18 B) and Q6_K (210 B) blocks sit on 2-byte boundaries. ByteAddressBuffer
 // loads need 4-byte alignment, so read the aligned dwords and shift.
+// Double-load (always both dwords) avoids fxc early-return / conditional-load bugs.
 uint ld32(uint a) {
-    const uint b = a & ~3u;
-    const uint lo = W.Load(b);
-    if ((a & 3u) == 0u)
-        return lo;
-    return (lo >> 16) | (W.Load(b + 4u) << 16);
+    uint b = a & 0xFFFFFFFCu;
+    uint lo = W.Load(b);
+    uint hi = W.Load(b + 4u);
+    return (a & 3u) == 0u ? lo : ((lo >> 16u) | (hi << 16u));
 }
 
 uint ld16(uint a) {
-    const uint v = W.Load(a & ~3u);
-    return (a & 2u) != 0u ? (v >> 16) : (v & 0xffffu);
+    uint v = W.Load(a & 0xFFFFFFFCu);
+    return (a & 2u) != 0u ? (v >> 16u) : (v & 0xFFFFu);
 }
 
 // X reads: block_q8_0 is 34 B, so q8_0 columns sit on 2-byte boundaries too.
 uint xld32(uint a) {
-    const uint b = a & ~3u;
-    const uint lo = X.Load(b);
-    if ((a & 3u) == 0u)
-        return lo;
-    return (lo >> 16) | (X.Load(b + 4u) << 16);
+    uint b = a & 0xFFFFFFFCu;
+    uint lo = X.Load(b);
+    uint hi = X.Load(b + 4u);
+    return (a & 3u) == 0u ? lo : ((lo >> 16u) | (hi << 16u));
 }
 
 uint xld16(uint a) {
-    const uint v = X.Load(a & ~3u);
-    return (a & 2u) != 0u ? (v >> 16) : (v & 0xffffu);
+    uint v = X.Load(a & 0xFFFFFFFCu);
+    return (a & 2u) != 0u ? (v >> 16u) : (v & 0xFFFFu);
 }
 
-// Packed signed int8 dot products — SM 6.0 compatible (Xbox One X GCN).
-// dot4add_i8packed is SM 6.4 only; emulate via arithmetic shift sign-extension.
-int _se8(uint v) { return (int)(v << 24) >> 24; }
+// Packed signed int8 dot products — SM 5.1 compatible (Xbox One X GCN / DXBC).
+// dot4add_i8packed is SM 6.4 only; emulate with asint sign-extension.
+int _se8(uint v) { return asint(v << 24) >> 24; }
 
 int dot4(uint a, uint b) {
     return _se8(a)       * _se8(b)       +
