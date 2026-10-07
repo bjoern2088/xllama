@@ -38,7 +38,8 @@ ByteAddressBuffer W : register(t0);
 RWByteAddressBuffer X : register(u1);
 RWStructuredBuffer<float> Y : register(u0);
 
-groupshared float red[NUM_ROWS][NUM_THREADS];
+// 1D layout avoids fxc SM 5.1 issues with 2D groupshared arrays.
+groupshared float red[NUM_ROWS * NUM_THREADS];
 
 // Q4_0 (18 B) and Q6_K (210 B) blocks sit on 2-byte boundaries. ByteAddressBuffer
 // loads need 4-byte alignment, so read the aligned dwords and shift.
@@ -68,9 +69,13 @@ uint xld16(uint a) {
     return (a & 2u) != 0u ? (v >> 16u) : (v & 0xFFFFu);
 }
 
-// Packed signed int8 dot products — SM 5.1 compatible (Xbox One X GCN / DXBC).
-// dot4add_i8packed is SM 6.4 only; emulate with asint sign-extension.
-int _se8(uint v) { return asint(v << 24) >> 24; }
+// Sign-extend low byte to int — SM 5.1 compatible pure-integer arithmetic.
+// dot4add_i8packed is SM 6.4 only; replaced with explicit multiply-accumulate.
+int _se8(uint v) {
+    uint b = v & 0xFFu;
+    uint neg = b >> 7u;
+    return (int)b - (int)(neg * 256u);
+}
 
 int dot4(uint a, uint b) {
     return _se8(a)       * _se8(b)       +
@@ -83,21 +88,30 @@ int sum4(uint b) {
     return _se8(b) + _se8(b >> 8) + _se8(b >> 16) + _se8(b >> 24);
 }
 
-// Sum each row's 64 partials and store; rows past n are skipped, never early-exit.
+// Parallel reduction — manually unrolled steps to avoid fxc [unroll]+barrier bug.
+// Each REDUCE_STEP(S): threads 0..(S-1) accumulate their row's partial from offset S.
+#define REDUCE_STEP(S) \
+    if (tid < (S)) { \
+        [unroll] for (uint _r = 0; _r < NUM_ROWS; ++_r) \
+            red[_r * NUM_THREADS + tid] += red[_r * NUM_THREADS + tid + (S)]; \
+    } \
+    GroupMemoryBarrierWithGroupSync()
+
 void reduce_store(float acc[NUM_ROWS], uint tid, uint row0, uint col) {
     [unroll]
     for (uint r = 0; r < NUM_ROWS; ++r)
-        red[r][tid] = acc[r];
+        red[r * NUM_THREADS + tid] = acc[r];
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint stride = NUM_THREADS / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            [unroll]
-            for (uint r = 0; r < NUM_ROWS; ++r)
-                red[r][tid] += red[r][tid + stride];
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
+#if NUM_THREADS >= 128
+    REDUCE_STEP(64);
+#endif
+    REDUCE_STEP(32);
+    REDUCE_STEP(16);
+    REDUCE_STEP(8);
+    REDUCE_STEP(4);
+    REDUCE_STEP(2);
+    REDUCE_STEP(1);
     if (tid < NUM_ROWS && row0 + tid < n)
-        Y[col * y_stride + row0 + tid] = red[tid][0];
+        Y[col * y_stride + row0 + tid] = red[tid * NUM_THREADS];
 }
+#undef REDUCE_STEP
