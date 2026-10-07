@@ -91,19 +91,19 @@ compile_target() {
 		"$ROOT/shaders/generated/gpugemv_q4k_dot4_dxil.h" \
 		"shaders/gpugemv_q4k_dot4.hlsl" "kGpugemvQ4kDot4Dxil" cs_6_4 ;;
 	mmv_q4_0 | mmv_q4_k | mmv_q6_k)
-		# cs_6_0: Xbox One X GCN only supports SM 6.0 (no dot4add_i8packed / SM 6.4)
+		# cs_5_1: Xbox One X Developer Mode UWP only supports DXBC (SM<=5.1), not DXIL
 		local t="${1#mmv_}" w sym
 		for w in 64 128; do
 			sym="kGgmlD3d12Mmv$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
 			compile_one "$ROOT/shaders/ggml_d3d12_mmv_${t}.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_mmv_${t}_t${w}_dxil.h" \
-				"shaders/ggml_d3d12_mmv_${t}.hlsl -D NUM_THREADS=${w}" "$sym" cs_6_0 \
+				"shaders/ggml_d3d12_mmv_${t}.hlsl -D NUM_THREADS=${w}" "$sym" cs_5_1 \
 				-D "NUM_THREADS=${w}"
 		done
 		;;
 	get_rows_q6_k) compile_one "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
 		"$ROOT/shaders/generated/ggml_d3d12_get_rows_q6_k_dxil.h" \
-		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_6_0 ;;
+		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_5_1 ;;
 	*)
 		echo "unknown target: $1 (naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k)" >&2
 		exit 2
