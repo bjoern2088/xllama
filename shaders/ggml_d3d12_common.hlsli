@@ -69,14 +69,19 @@ uint xld16(uint a) {
     return (a & 2u) != 0u ? (v >> 16) : (v & 0xffffu);
 }
 
-// Packed signed int8 dot products (SM 6.4). Weight lanes (nibbles 0..15, Q6_K
-// values 0..63) are valid non-negative int8.
+// Packed signed int8 dot products — SM 6.0 compatible (Xbox One X GCN).
+// dot4add_i8packed is SM 6.4 only; emulate via arithmetic shift sign-extension.
+int _se8(uint v) { return (int)(v << 24) >> 24; }
+
 int dot4(uint a, uint b) {
-    return dot4add_i8packed(a, b, 0);
+    return _se8(a)       * _se8(b)       +
+           _se8(a >>  8) * _se8(b >>  8) +
+           _se8(a >> 16) * _se8(b >> 16) +
+           _se8(a >> 24) * _se8(b >> 24);
 }
 
 int sum4(uint b) {
-    return dot4add_i8packed(b, 0x01010101u, 0);
+    return _se8(b) + _se8(b >> 8) + _se8(b >> 16) + _se8(b >> 24);
 }
 
 // Sum each row's 64 partials and store; rows past n are skipped, never early-exit.
