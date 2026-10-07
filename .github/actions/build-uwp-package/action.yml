@@ -103,19 +103,21 @@ runs:
         }
         Write-Host "Both patched DLLs match NuGet installs."
 
-    - name: Recompile D3D12 MMV shaders (cs_5_1 DXBC — Xbox One X UWP)
+    - name: Recompile D3D12 MMV shaders (cs_5_1 DXBC via fxc.exe — Xbox One X UWP)
       shell: bash
       run: |
         set -euo pipefail
-        # Find Windows SDK dxc.exe (supports cs_5_1 -> DXBC output)
-        DXC=$(find "C:/Program Files (x86)/Windows Kits/10/bin" -name "dxc.exe" -path "*/x64/*" 2>/dev/null | sort -V | tail -1)
-        if [ -z "$DXC" ]; then
-          echo "dxc.exe not found in Windows SDK" >&2
+        # Must use fxc.exe (legacy D3D compiler), NOT dxc.exe.
+        # dxc.exe silently promotes cs_5_1 → cs_6_0 DXIL; Xbox One X Developer
+        # Mode UWP only loads DXBC (SM≤5.1), so DXIL causes E_FAIL at pipeline creation.
+        FXC=$(find "C:/Program Files (x86)/Windows Kits/10/bin" -name "fxc.exe" -path "*/x64/*" 2>/dev/null | sort -V | tail -1)
+        if [ -z "$FXC" ]; then
+          echo "fxc.exe not found in Windows SDK" >&2
           exit 1
         fi
-        echo "Using dxc: $DXC"
-        "$DXC" --version
-        DXC="$DXC" bash scripts/compile-gpugemv-shader.sh mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k
+        echo "Using fxc: $FXC"
+        "$FXC" 2>&1 | head -2 || true
+        FXC="$FXC" bash scripts/compile-gpugemv-shader.sh mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k
 
     - name: Build UWP package
       shell: pwsh
