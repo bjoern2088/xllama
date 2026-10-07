@@ -103,11 +103,11 @@ runs:
         }
         Write-Host "Both patched DLLs match NuGet installs."
 
-    - name: Recompile D3D12 MMV shaders (cs_6_0 — Xbox One X GCN SM6.0)
+    - name: Recompile D3D12 MMV shaders (cs_5_1 DXBC — Xbox One X UWP)
       shell: bash
       run: |
         set -euo pipefail
-        # Find Windows SDK dxc.exe
+        # Find Windows SDK dxc.exe (supports cs_5_1 -> DXBC output)
         DXC=$(find "C:/Program Files (x86)/Windows Kits/10/bin" -name "dxc.exe" -path "*/x64/*" 2>/dev/null | sort -V | tail -1)
         if [ -z "$DXC" ]; then
           echo "dxc.exe not found in Windows SDK" >&2
