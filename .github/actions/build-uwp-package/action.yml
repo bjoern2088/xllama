@@ -117,6 +117,15 @@ runs:
         fi
         echo "Using fxc: $FXC"
         "$FXC" 2>&1 | head -2 || true
+        # Sanity check: compile a trivial CS to verify fxc path handling works.
+        printf '[numthreads(64,1,1)]\nvoid CSMain(uint t:SV_GroupIndex){}\n' > /tmp/fxc_trivial.hlsl
+        TRIVIAL_OUT=$(mktemp)
+        if "$FXC" -T cs_5_1 -E CSMain -Fo "$TRIVIAL_OUT" /tmp/fxc_trivial.hlsl 2>&1; then
+          echo "fxc trivial test OK ($(wc -c < "$TRIVIAL_OUT") bytes DXBC)"
+        else
+          echo "fxc trivial test FAILED — aborting" >&2; exit 1
+        fi
+        rm -f "$TRIVIAL_OUT"
         FXC="$FXC" bash scripts/compile-gpugemv-shader.sh mmv_q4_0 mmv_q4_k mmv_q6_k get_rows_q6_k
 
     - name: Build UWP package
