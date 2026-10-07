@@ -6,24 +6,21 @@
 #   shaders/gpugemv_q4k_wave32.hlsl → gpugemv_q4k_wave32_dxil.h (H6.2 LDS-red)
 #   shaders/gpugemv_q4k_rows.hlsl   → gpugemv_q4k_rows_dxil.h   (H6.3 multi-row)
 #   shaders/gpugemv_q4k_dot4.hlsl   → gpugemv_q4k_dot4_dxil.h   (H6.3 int8 dot, cs_6_4)
-#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q6_k}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_6_4)
-#     (D2 backend; one blob per thread-group width, -D NUM_THREADS)
-#   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_6_4)
+#   shaders/ggml_d3d12_mmv_{q4_0,q4_k,q6_k}.hlsl → ggml_d3d12_mmv_*_t{64,128}_dxil.h (cs_5_1 DXBC)
+#     (Xbox One X UWP; DXBC via fxc.exe — dxc auto-promotes cs_5_1 to DXIL which Xbox rejects)
+#     one blob per thread-group width, -D NUM_THREADS
+#   shaders/ggml_d3d12_get_rows_q6_k.hlsl → ggml_d3d12_get_rows_q6_k_dxil.h (cs_5_1 DXBC)
 #
 # Usage: compile-gpugemv-shader.sh [naive|wave32|rows|dot4|mmv_q4_0|mmv_q4_k|mmv_q6_k|get_rows_q6_k ...]
 #        (default: all)
-# A different dxc release emits different bytes: regenerate only the targets
+# DXIL targets (naive/wave32/rows/dot4): set DXC=<path to dxc>
+# DXBC targets (mmv_*/get_rows_q6_k):   set FXC=<path to fxc.exe> (Windows SDK legacy compiler)
+# A different compiler release emits different bytes: regenerate only the targets
 # you changed so measured blobs stay the ones the CSVs were recorded with.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DXC="${DXC:-dxc}"
-
-if [[ ! -x "$DXC" ]] && ! command -v "$DXC" >/dev/null 2>&1; then
-	echo "dxc not found (set DXC=...). Example Linux release:" >&2
-	echo "  https://github.com/microsoft/DirectXShaderCompiler/releases" >&2
-	echo "  pacman extra/directx-shader-compiler (do not install AUR packages)" >&2
-	exit 1
-fi
+FXC="${FXC:-fxc}"
 
 emit_header() {
 	local dxil="$1"
@@ -63,6 +60,12 @@ PY
 }
 
 compile_one() {
+	if [[ ! -x "$DXC" ]] && ! command -v "$DXC" >/dev/null 2>&1; then
+		echo "dxc not found (set DXC=...). Example Linux release:" >&2
+		echo "  https://github.com/microsoft/DirectXShaderCompiler/releases" >&2
+		echo "  pacman extra/directx-shader-compiler (do not install AUR packages)" >&2
+		exit 1
+	fi
 	local hlsl="$1"
 	local out_h="$2"
 	local source_rel="$3"
@@ -72,6 +75,27 @@ compile_one() {
 	local tmp
 	tmp="$(mktemp)"
 	"$DXC" -T "$profile" -E CSMain "$@" -Fo "$tmp" "$hlsl"
+	emit_header "$tmp" "$out_h" "$source_rel" "$symbol" "$profile"
+	rm -f "$tmp"
+}
+
+# compile_one_fxc — uses fxc.exe (Windows SDK legacy compiler) to produce real
+# SM 5.1 DXBC bytecode. dxc.exe rejects cs_5_1 and auto-promotes to cs_6_0
+# DXIL, which Xbox One X Developer Mode UWP cannot load.
+compile_one_fxc() {
+	if [[ ! -x "$FXC" ]] && ! command -v "$FXC" >/dev/null 2>&1; then
+		echo "fxc.exe not found (set FXC=<path to fxc.exe> — Windows SDK required for DXBC targets)" >&2
+		exit 1
+	fi
+	local hlsl="$1"
+	local out_h="$2"
+	local source_rel="$3"
+	local symbol="$4"
+	local profile="$5"
+	shift 5
+	local tmp
+	tmp="$(mktemp)"
+	"$FXC" -T "$profile" -E CSMain "$@" -Fo "$tmp" "$hlsl"
 	emit_header "$tmp" "$out_h" "$source_rel" "$symbol" "$profile"
 	rm -f "$tmp"
 }
@@ -91,17 +115,18 @@ compile_target() {
 		"$ROOT/shaders/generated/gpugemv_q4k_dot4_dxil.h" \
 		"shaders/gpugemv_q4k_dot4.hlsl" "kGpugemvQ4kDot4Dxil" cs_6_4 ;;
 	mmv_q4_0 | mmv_q4_k | mmv_q6_k)
-		# cs_5_1: Xbox One X Developer Mode UWP only supports DXBC (SM<=5.1), not DXIL
+		# Xbox One X UWP: must use fxc.exe → real SM 5.1 DXBC.
+		# dxc.exe silently promotes cs_5_1 → cs_6_0 DXIL which Xbox D3D12 rejects.
 		local t="${1#mmv_}" w sym
 		for w in 64 128; do
 			sym="kGgmlD3d12Mmv$(echo "$t" | sed -e 's/_\(.\)/\U\1/g' -e 's/^./\U&/')T${w}Dxil"
-			compile_one "$ROOT/shaders/ggml_d3d12_mmv_${t}.hlsl" \
+			compile_one_fxc "$ROOT/shaders/ggml_d3d12_mmv_${t}.hlsl" \
 				"$ROOT/shaders/generated/ggml_d3d12_mmv_${t}_t${w}_dxil.h" \
 				"shaders/ggml_d3d12_mmv_${t}.hlsl -D NUM_THREADS=${w}" "$sym" cs_5_1 \
 				-D "NUM_THREADS=${w}"
 		done
 		;;
-	get_rows_q6_k) compile_one "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
+	get_rows_q6_k) compile_one_fxc "$ROOT/shaders/ggml_d3d12_get_rows_q6_k.hlsl" \
 		"$ROOT/shaders/generated/ggml_d3d12_get_rows_q6_k_dxil.h" \
 		"shaders/ggml_d3d12_get_rows_q6_k.hlsl" "kGgmlD3d12GetRowsQ6KDxil" cs_5_1 ;;
 	*)
