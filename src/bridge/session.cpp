@@ -450,6 +450,76 @@ class LlamaSession final : public Session {
     // whenever the KV state stops being trustworthy (decode failure).
     std::vector<llama_token> m_kv_tokens;
 
+    // jarvis-snapshot: hybrid/recurrent caches (LFM2) cannot rewind a divergent
+    // tail (#170a degrades to a full re-prefill), so a stateless API client that
+    // resends the same system prompt pays the whole prefill every request. Keep
+    // a few sequence-state snapshots taken at a shared-prefix boundary and
+    // restore the longest one that prefixes the new prompt instead.
+    struct PrefixSnap {
+        std::vector<llama_token> toks;
+        std::vector<uint8_t> data;
+        uint64_t used = 0;
+    };
+    std::vector<PrefixSnap> m_snaps;
+    std::vector<std::vector<llama_token>> m_prev_prompts; // recent full prompts (boundary discovery)
+    uint64_t m_snap_clock = 0;
+    static constexpr size_t kMaxSnaps = 4;
+    static constexpr size_t kMinSnapTokens = 32;
+
+    static size_t lcp(const std::vector<llama_token>& a, const std::vector<llama_token>& b,
+                      size_t cap) {
+        size_t n = 0;
+        while (n < a.size() && n < b.size() && n < cap && a[n] == b[n])
+            ++n;
+        return n;
+    }
+
+    bool is_hybrid_cache() const {
+        return llama_model_is_hybrid(m_model.get()) || llama_model_is_recurrent(m_model.get());
+    }
+
+    // Longest snapshot whose tokens are a strict prefix of `tokens` (<= cap).
+    PrefixSnap* find_snap(const std::vector<llama_token>& tokens, size_t cap) {
+        PrefixSnap* best = nullptr;
+        for (auto& sn : m_snaps) {
+            if (sn.toks.size() > cap || (best && sn.toks.size() <= best->toks.size()))
+                continue;
+            if (lcp(sn.toks, tokens, cap) == sn.toks.size())
+                best = &sn;
+        }
+        return best;
+    }
+
+    void save_snap(llama_context* ctx, const std::vector<llama_token>& toks) {
+        for (auto& sn : m_snaps)
+            if (sn.toks == toks) {
+                sn.used = ++m_snap_clock;
+                return;
+            }
+        const size_t sz = llama_state_seq_get_size(ctx, 0);
+        if (sz == 0)
+            return;
+        PrefixSnap sn;
+        sn.data.resize(sz);
+        if (llama_state_seq_get_data(ctx, sn.data.data(), sz, 0) != sz)
+            return;
+        sn.toks = toks;
+        sn.used = ++m_snap_clock;
+        if (m_snaps.size() >= kMaxSnaps) {
+            auto lru = std::min_element(m_snaps.begin(), m_snaps.end(),
+                                        [](const PrefixSnap& x, const PrefixSnap& y) {
+                                            return x.used < y.used;
+                                        });
+            *lru = std::move(sn);
+        } else {
+            m_snaps.push_back(std::move(sn));
+        }
+        char sb[160];
+        snprintf(sb, sizeof(sb), "[xllama] session: prefix snapshot saved — %zu tok, %zu KiB, %zu cached\n",
+                 toks.size(), sz / 1024, m_snaps.size());
+        log_output(sb);
+    }
+
     bool m_kv_q8 = false;         // #171: q8_0 KV + forced flash attention
     bool m_prompt_lookup = false; // #210: draft-free speculative decoding
     int m_gpu_layers = 0;         // layers on the d3d12 backend (llama_gpu.h)
@@ -606,6 +676,31 @@ class LlamaSession final : public Session {
         // diverges immediately and degrades to the old full clear.
         llama_memory_t mem = llama_get_memory(ctx);
         size_t kv_keep = 0;
+        const bool hybrid = is_hybrid_cache();
+        if (full_prompt && hybrid && !tokens.empty()) {
+            // A pure extension of the resident tokens needs nothing; anything
+            // else would hit the unsupported tail rewind below. Restore the
+            // best snapshot instead so #170a sees a pure extension.
+            const size_t cap = tokens.size() - 1;
+            const size_t common = lcp(m_kv_tokens, tokens, cap);
+            const bool pure_ext = !m_kv_tokens.empty() && common == m_kv_tokens.size();
+            PrefixSnap* sn = pure_ext ? nullptr : find_snap(tokens, cap);
+            if (sn && sn->toks.size() > common) {
+                llama_memory_clear(mem, true);
+                if (llama_state_seq_set_data(ctx, sn->data.data(), sn->data.size(), 0) > 0) {
+                    m_kv_tokens = sn->toks;
+                    sn->used = ++m_snap_clock;
+                    char sb[128];
+                    snprintf(sb, sizeof(sb), "[xllama] session: prefix snapshot restored — %zu of %zu tok\n",
+                             sn->toks.size(), tokens.size());
+                    log_output(sb);
+                } else {
+                    log_output("[xllama] session: prefix snapshot restore failed — full prefill\n");
+                    llama_memory_clear(mem, true);
+                    m_kv_tokens.clear();
+                }
+            }
+        }
         if (full_prompt) {
             const size_t max_keep = tokens.empty() ? 0 : tokens.size() - 1;
             while (kv_keep < m_kv_tokens.size() && kv_keep < max_keep &&
@@ -740,7 +835,35 @@ class LlamaSession final : public Session {
         // LOGICAL batch only — the physical ubatch stays 512 (#172 optimum),
         // which is what the prefill rate was measured on.
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        if (!prefill_chunked(ctx, pf, n_pf)) {
+        int n_pf_rest = n_pf;
+        llama_token* pf_rest = pf;
+        if (full_prompt && hybrid) {
+            // Boundary = common prefix with the previous request, backed off to
+            // just after the last control token (<|im_start|> etc.) so it ends on
+            // a template edge and matches the next request too.
+            size_t L = 0;
+            for (const auto& pp : m_prev_prompts) // keepalives in between must not hide the pattern
+                L = std::max(L, lcp(pp, tokens, tokens.size() - 1));
+            while (L > kv_keep && !llama_vocab_is_control(vocab, tokens[L - 1]))
+                --L;
+            if (L >= kv_keep + kMinSnapTokens) {
+                const int n_head = static_cast<int>(L - kv_keep);
+                if (!prefill_chunked(ctx, pf, n_head)) {
+                    res.error_msg = "prompt decode failed";
+                    log_output("[xllama] session generate: prompt decode failed (snapshot head)\n");
+                    m_kv_tokens.clear();
+                    llama_memory_clear(mem, true);
+                    return res;
+                }
+                save_snap(ctx, std::vector<llama_token>(tokens.begin(), tokens.begin() + L));
+                pf_rest = pf + n_head;
+                n_pf_rest = n_pf - n_head;
+            }
+            m_prev_prompts.push_back(tokens);
+            if (m_prev_prompts.size() > 4)
+                m_prev_prompts.erase(m_prev_prompts.begin());
+        }
+        if (!prefill_chunked(ctx, pf_rest, n_pf_rest)) {
             res.error_msg = "prompt decode failed";
             log_output("[xllama] session generate: prompt decode failed\n");
             // The cache now holds a partial batch — nothing about it is
