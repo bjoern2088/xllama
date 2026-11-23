@@ -685,7 +685,9 @@ class LlamaSession final : public Session {
             const size_t common = lcp(m_kv_tokens, tokens, cap);
             const bool pure_ext = !m_kv_tokens.empty() && common == m_kv_tokens.size();
             PrefixSnap* sn = pure_ext ? nullptr : find_snap(tokens, cap);
-            if (sn && sn->toks.size() > common) {
+            // Any resident common prefix is worthless here: keeping it would need
+            // the tail rewind the hybrid cache refuses, so a snapshot always wins.
+            if (sn) {
                 llama_memory_clear(mem, true);
                 if (llama_state_seq_set_data(ctx, sn->data.data(), sn->data.size(), 0) > 0) {
                     m_kv_tokens = sn->toks;
